@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_DIR="${HOME}/.config/ais"
+CONFIG_FILE="${CONFIG_DIR}/config"
+
+trap 'echo "Error on line $LINENO" >&2' ERR
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+save_key() {
+  local -r key="$1"
+  local -r value="$2"
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$CONFIG_FILE" ]] && grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+    sed -i '' "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE"
+  else
+    echo "${key}=${value}" >> "$CONFIG_FILE"
+  fi
+  chmod 600 "$CONFIG_FILE"
+}
+
+require_cmd() {
+  local -r cmd="$1"
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: '${cmd}' is required but not installed." >&2
+    exit 1
+  fi
+}
+
+# ── Help ─────────────────────────────────────────────────────────────
+
+show_help() {
+  cat <<'EOF'
+ais - AI Search CLI
+
+Usage:
+  ais                                  Show this help
+  ais help                             Show this help
+  ais config                           Configure a provider (API key)
+
+Providers:
+  context7    Search libraries and query documentation
+
+Context7 commands:
+  ais context7 --libraryName <name>                Search for libraries
+  ais context7 --libraryId <id> --query <query>    Query library documentation
+
+Examples:
+  ais context7 --libraryName "dagster"
+  ais context7 --libraryId "dagster-io/dagster" --query "set timezone"
+EOF
+}
+
+# ── Config ───────────────────────────────────────────────────────────
+
+cmd_config() {
+  echo "Available providers:"
+  echo "  1) context7"
+  echo ""
+  printf "Select provider [1]: "
+  read -r choice
+
+  case "${choice:-1}" in
+    1|context7)
+      printf "Enter Context7 API key: "
+      read -rs api_key
+      echo ""
+      if [[ -z "$api_key" ]]; then
+        echo "Error: API key cannot be empty." >&2
+        exit 1
+      fi
+      save_key "CONTEXT7_API_KEY" "$api_key"
+      echo "Context7 API key saved."
+      ;;
+    *)
+      echo "Error: Unknown provider." >&2
+      exit 1
+      ;;
+  esac
+}
+
+# ── Context7 ─────────────────────────────────────────────────────────
+
+cmd_context7() {
+  load_config
+
+  if [[ -z "${CONTEXT7_API_KEY:-}" ]]; then
+    echo "Error: Context7 API key not configured. Run 'ais config' first." >&2
+    exit 1
+  fi
+
+  local library_name="" library_id="" query=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --libraryName)
+        [[ $# -ge 2 ]] || { echo "Error: --libraryName requires a value" >&2; exit 1; }
+        library_name="$2"; shift 2 ;;
+      --libraryId)
+        [[ $# -ge 2 ]] || { echo "Error: --libraryId requires a value" >&2; exit 1; }
+        library_id="$2"; shift 2 ;;
+      --query)
+        [[ $# -ge 2 ]] || { echo "Error: --query requires a value" >&2; exit 1; }
+        query="$2"; shift 2 ;;
+      --)
+        shift; break ;;
+      *)
+        echo "Error: Unknown option '$1'" >&2
+        exit 1 ;;
+    esac
+  done
+
+  require_cmd curl
+
+  # Mode 1: Search libraries
+  if [[ -n "$library_name" && -z "$library_id" ]]; then
+    local url="https://context7.com/api/v2/libs/search?libraryName=$(urlencode "$library_name")"
+    if [[ -n "$query" ]]; then
+      url="${url}&query=$(urlencode "$query")"
+    fi
+
+    local response
+    response=$(curl -sS --fail "$url" -H "Authorization: Bearer ${CONTEXT7_API_KEY}") || {
+      echo "Error: API request failed." >&2
+      exit 1
+    }
+
+    # Parse JSON search results (no jq needed)
+    if [[ "$response" == *'"results":[]'* ]]; then
+      echo "No results found for '${library_name}'."
+      return
+    fi
+
+    # Split results array into one object per line
+    local items
+    items=$(echo "$response" | sed 's/.*"results":\[//;s/\]}$//' | sed $'s/},{"id"/}\\\n{"id"/g')
+
+    local count=0
+    while IFS= read -r _; do
+      ((count++))
+    done <<< "$items"
+
+    echo "Found ${count} result(s) for '${library_name}':"
+    echo ""
+
+    while IFS= read -r item; do
+      [[ -z "$item" ]] && continue
+      local id title desc snippets stars score
+      id=$(echo "$item" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+      title=$(echo "$item" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p')
+      desc=$(echo "$item" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p')
+      snippets=$(echo "$item" | sed -n 's/.*"totalSnippets":\([0-9]*\).*/\1/p')
+      stars=$(echo "$item" | sed -n 's/.*"stars":\(-\{0,1\}[0-9]*\).*/\1/p')
+      score=$(echo "$item" | sed -n 's/.*"benchmarkScore":\([0-9.]*\).*/\1/p')
+      echo "  ${id}"
+      echo "    ${title} - ${desc:-No description}"
+      echo "    Snippets: ${snippets}  Stars: ${stars}  Score: ${score}"
+      echo ""
+    done <<< "$items"
+    return
+  fi
+
+  # Mode 2: Query documentation
+  if [[ -n "$library_id" && -n "$query" ]]; then
+    # Ensure libraryId starts with /
+    if [[ "$library_id" != /* ]]; then
+      library_id="/${library_id}"
+    fi
+
+    local url="https://context7.com/api/v2/context?libraryId=$(urlencode "$library_id")&query=$(urlencode "$query")&type=txt"
+
+    curl -sS --fail "$url" -H "Authorization: Bearer ${CONTEXT7_API_KEY}" || {
+      echo "Error: API request failed." >&2
+      exit 1
+    }
+    echo ""
+    return
+  fi
+
+  echo "Error: Invalid arguments. See 'ais help' for usage." >&2
+  exit 1
+}
+
+# ── URL encoding ─────────────────────────────────────────────────────
+
+urlencode() {
+  local -r string="$1"
+  local encoded="" i c
+  for (( i = 0; i < ${#string}; i++ )); do
+    c="${string:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) encoded+="$c" ;;
+      *) encoded+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  echo "$encoded"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-help}"
+
+  case "$cmd" in
+    help|--help|-h)
+      show_help ;;
+    config)
+      cmd_config ;;
+    context7)
+      shift
+      cmd_context7 "$@" ;;
+    *)
+      echo "Error: Unknown command '${cmd}'. Run 'ais help' for usage." >&2
+      exit 1 ;;
+  esac
+}
+
+main "$@"
