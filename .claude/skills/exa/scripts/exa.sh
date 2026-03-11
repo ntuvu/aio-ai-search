@@ -50,8 +50,11 @@ json_escape() {
 
 # Unescape JSON string to plain text
 json_unescape() {
-  sed -e 's/\\n/\n/g' -e 's/\\t/\t/g' -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+  sed -e 's/\\n/\n/g' -e 's/\\t/\t/g' -e 's/\\"/"/g' -e 's/\\\\/\\/g' \
+      -e 's/\\u[0-9a-fA-F]\{4\}//g'
 }
+
+case "${1:-}" in --help|-h) usage ;; esac
 
 command="$1"; shift
 
@@ -104,17 +107,21 @@ case "$command" in
       }
     }'
 
-    response=$(curl -sf \
+    response=$(curl -s -w '\n%{http_code}' \
       -X POST "$API_URL" \
       -H "accept: application/json" \
       -H "content-type: application/json" \
       -H "x-api-key: $EXA_API_KEY" \
       -H "x-exa-integration: web-search-bash" \
       --max-time 25 \
-      -d "$body") || die "request to Exa API failed"
+      -d "$body") || die "request to Exa API failed (network error)"
+
+    http_code="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] || die "Exa API returned HTTP $http_code"
 
     context=$(printf '%s' "$response" \
-      | sed -e 's/.*"context":"//' -e 's/","requestId".*//' -e 's/","autopromptString".*//' \
+      | sed -e 's/.*"context":"//' -e 's/","[a-zA-Z]*".*//' \
       | json_unescape)
 
     if [ -z "$context" ]; then
@@ -155,17 +162,21 @@ case "$command" in
       "tokensNum": '"$tokens"'
     }'
 
-    response=$(curl -sf \
+    response=$(curl -s -w '\n%{http_code}' \
       -X POST "$API_URL" \
       -H "accept: application/json" \
       -H "content-type: application/json" \
       -H "x-api-key: $EXA_API_KEY" \
       -H "x-exa-integration: exa-code-bash" \
       --max-time 30 \
-      -d "$body") || die "request to Exa API failed"
+      -d "$body") || die "request to Exa API failed (network error)"
+
+    http_code="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] || die "Exa API returned HTTP $http_code"
 
     code_content=$(printf '%s' "$response" \
-      | sed -e 's/.*"response":"//' -e 's/"}//' \
+      | sed -e 's/.*"response":"//' -e 's/"[[:space:]]*}[[:space:]]*$//' \
       | json_unescape)
 
     if [ -z "$code_content" ]; then
@@ -207,20 +218,25 @@ case "$command" in
       }
     }'
 
-    response=$(curl -sf \
+    response=$(curl -s -w '\n%{http_code}' \
       -X POST "$API_URL" \
       -H "accept: application/json" \
       -H "content-type: application/json" \
       -H "x-api-key: $EXA_API_KEY" \
       -H "x-exa-integration: crawling-mcp" \
       --max-time 25 \
-      -d "$body") || die "request to Exa API failed"
+      -d "$body") || die "request to Exa API failed (network error)"
 
-    # Extract first result fields
-    title=$(printf '%s' "$response" | sed -e 's/.*"title":"//' -e 's/".*//')
-    url_out=$(printf '%s' "$response" | sed -e 's/.*"url":"//' -e 's/".*//')
-    text=$(printf '%s' "$response" \
-      | sed -e 's/.*"text":"//' -e 's/"}].*$//' \
+    http_code="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] || die "Exa API returned HTTP $http_code"
+
+    # Extract first result object, then parse fields from it
+    first_result=$(printf '%s' "$response" | sed -e 's/.*"results":\[{/{/' -e 's/}].*/}/')
+    title=$(printf '%s' "$first_result" | sed -e 's/.*"title":"//' -e 's/".*//')
+    url_out=$(printf '%s' "$first_result" | sed -e 's/.*"url":"//' -e 's/".*//')
+    text=$(printf '%s' "$first_result" \
+      | sed -e 's/.*"text":"//' -e 's/"[[:space:]]*}[[:space:]]*$//' \
       | json_unescape)
 
     if [ -z "$text" ]; then

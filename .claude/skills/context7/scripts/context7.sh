@@ -47,8 +47,11 @@ urlencode() {
 
 # Unescape JSON string to plain text
 json_unescape() {
-  sed -e 's/\\n/\n/g' -e 's/\\t/\t/g' -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+  sed -e 's/\\n/\n/g' -e 's/\\t/\t/g' -e 's/\\"/"/g' -e 's/\\\\/\\/g' \
+      -e 's/\\u[0-9a-fA-F]\{4\}//g'
 }
+
+case "${1:-}" in --help|-h) usage ;; esac
 
 command="$1"; shift
 
@@ -80,11 +83,15 @@ case "$command" in
       url="${url}&query=${encoded_query}"
     fi
 
-    response=$(curl -sf \
+    response=$(curl -s -w '\n%{http_code}' \
       -X GET "$url" \
       -H "accept: application/json" \
       -H "Authorization: Bearer $CONTEXT_API_KEY" \
-      --max-time 15) || die "request to Context7 API failed"
+      --max-time 15) || die "request to Context7 API failed (network error)"
+
+    http_code="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] || die "Context7 API returned HTTP $http_code"
 
     if printf '%s' "$response" | grep -q '"error"'; then
       err_msg=$(printf '%s' "$response" | sed -e 's/.*"error":"//' -e 's/".*//')
@@ -102,9 +109,9 @@ case "$command" in
     count=0
     while IFS= read -r obj; do
       [ -z "$obj" ] && continue
-      id=$(printf '%s' "$obj" | sed -e 's/.*"id":"//' -e 's/".*//')
-      title=$(printf '%s' "$obj" | sed -e 's/.*"title":"//' -e 's/".*//')
-      desc=$(printf '%s' "$obj" | sed -e 's/.*"description":"//' -e 's/".*//')
+      id=$(printf '%s' "$obj" | awk -F'"id":"' '{split($2,a,"\""); print a[1]; exit}')
+      title=$(printf '%s' "$obj" | awk -F'"title":"' '{split($2,a,"\""); print a[1]; exit}')
+      desc=$(printf '%s' "$obj" | awk -F'"description":"' '{split($2,a,"\""); print a[1]; exit}')
       snippets=$(printf '%s' "$obj" | sed -e 's/.*"totalSnippets"://' -e 's/[,}].*//')
       trust=$(printf '%s' "$obj" | sed -e 's/.*"trustScore"://' -e 's/[,}].*//')
 
@@ -144,11 +151,15 @@ case "$command" in
     encoded_query=$(urlencode "$query")
     url="${API_URL}?libraryId=${encoded_id}&query=${encoded_query}&type=txt"
 
-    response=$(curl -sf \
+    response=$(curl -s -w '\n%{http_code}' \
       -X GET "$url" \
       -H "accept: application/json" \
       -H "Authorization: Bearer $CONTEXT_API_KEY" \
-      --max-time 30) || die "request to Context7 API failed"
+      --max-time 30) || die "request to Context7 API failed (network error)"
+
+    http_code="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] || die "Context7 API returned HTTP $http_code"
 
     if printf '%s' "$response" | grep -q '"error"'; then
       err_msg=$(printf '%s' "$response" | sed -e 's/.*"error":"//' -e 's/".*//')
@@ -157,7 +168,7 @@ case "$command" in
 
     if printf '%s' "$response" | grep -q '"data"'; then
       content=$(printf '%s' "$response" \
-        | sed -e 's/.*"data":"//' -e 's/"[}]*$//' \
+        | sed -e 's/.*"data":"//' -e 's/"[[:space:]]*}[[:space:]]*$//' \
         | json_unescape)
     else
       content="$response"
